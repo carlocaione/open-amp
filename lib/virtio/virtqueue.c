@@ -11,6 +11,7 @@
 #include <metal/atomic.h>
 #include <metal/log.h>
 #include <metal/alloc.h>
+#include <metal/cache.h>
 
 /* Prototype for internal functions. */
 static void vq_ring_init(struct virtqueue *, void *, int);
@@ -27,6 +28,17 @@ static int virtqueue_nused(struct virtqueue *vq);
 #ifndef VIRTIO_MASTER_ONLY
 static int virtqueue_navail(struct virtqueue *vq);
 #endif
+
+static inline void vq_ring_contro_block_flush(struct virtqueue *vq, unsigned long align)
+{
+	struct vring *vr;
+	unsigned int size;
+
+	vr = &vq->vq_ring;
+	size = vring_size(vr->num, align);
+
+	metal_cache_flush(vr->desc, size);
+}
 
 /* Default implementation of P2V based on libmetal */
 static inline void *virtqueue_phys_to_virt(struct virtqueue *vq,
@@ -87,6 +99,9 @@ int virtqueue_create(struct virtio_device *virt_dev, unsigned short id,
 		/* Initialize vring control block in virtqueue. */
 		vq_ring_init(vq, ring->vaddr, ring->align);
 	}
+
+	/* Flush the vring control block */
+	vq_ring_contro_block_flush(vq, ring->align);
 
 	return status;
 }
@@ -174,6 +189,7 @@ void *virtqueue_get_buffer(struct virtqueue *vq, uint32_t *len, uint16_t *idx)
 	void *cookie;
 	uint16_t used_idx, desc_idx;
 
+	metal_cache_invalidate(&vq->vq_ring.used->idx, sizeof(uint16_t));
 	if (!vq || vq->vq_used_cons_idx == vq->vq_ring.used->idx)
 		return NULL;
 
@@ -183,6 +199,7 @@ void *virtqueue_get_buffer(struct virtqueue *vq, uint32_t *len, uint16_t *idx)
 	uep = &vq->vq_ring.used->ring[used_idx];
 
 	atomic_thread_fence(memory_order_seq_cst);
+	metal_cache_invalidate(uep, sizeof(struct vring_used_elem));
 
 	desc_idx = (uint16_t)uep->id;
 	if (len)
@@ -195,6 +212,10 @@ void *virtqueue_get_buffer(struct virtqueue *vq, uint32_t *len, uint16_t *idx)
 
 	if (idx)
 		*idx = used_idx;
+
+	/* Invalidate the buffer before returning it */
+	metal_cache_invalidate(cookie, *len);
+
 	VQUEUE_IDLE(vq);
 
 	return cookie;
@@ -202,6 +223,8 @@ void *virtqueue_get_buffer(struct virtqueue *vq, uint32_t *len, uint16_t *idx)
 
 uint32_t virtqueue_get_buffer_length(struct virtqueue *vq, uint16_t idx)
 {
+	metal_cache_invalidate(&vq->vq_ring.desc[idx].len, sizeof(uint16_t));
+
 	return vq->vq_ring.desc[idx].len;
 }
 
@@ -241,6 +264,8 @@ void *virtqueue_get_available_buffer(struct virtqueue *vq, uint16_t *avail_idx,
 	void *buffer;
 
 	atomic_thread_fence(memory_order_seq_cst);
+
+	metal_cache_invalidate(&vq->vq_ring.avail->idx, sizeof(uint16_t));
 	if (vq->vq_available_idx == vq->vq_ring.avail->idx) {
 		return NULL;
 	}
@@ -248,10 +273,16 @@ void *virtqueue_get_available_buffer(struct virtqueue *vq, uint16_t *avail_idx,
 	VQUEUE_BUSY(vq);
 
 	head_idx = vq->vq_available_idx++ & (vq->vq_nentries - 1);
+
+	metal_cache_invalidate(&vq->vq_ring.avail->ring[head_idx], sizeof(uint16_t));
 	*avail_idx = vq->vq_ring.avail->ring[head_idx];
 
+	metal_cache_invalidate(&vq->vq_ring.desc[*avail_idx], sizeof(struct vring_desc));
 	buffer = virtqueue_phys_to_virt(vq, vq->vq_ring.desc[*avail_idx].addr);
 	*len = vq->vq_ring.desc[*avail_idx].len;
+
+	/* Invalidate the buffer before returning it */
+	metal_cache_invalidate(buffer, *len);
 
 	VQUEUE_IDLE(vq);
 
@@ -284,9 +315,12 @@ int virtqueue_add_consumed_buffer(struct virtqueue *vq, uint16_t head_idx,
 	used_desc->id = head_idx;
 	used_desc->len = len;
 
+	metal_cache_flush(used_desc, sizeof(struct vring_used_elem));
+
 	atomic_thread_fence(memory_order_seq_cst);
 
 	vq->vq_ring.used->idx++;
+	metal_cache_flush(&vq->vq_ring.used->idx, sizeof(uint16_t));
 
 	/* Keep pending count until virtqueue_notify(). */
 	vq->vq_queued_cnt++;
@@ -323,22 +357,28 @@ void virtqueue_disable_cb(struct virtqueue *vq)
 		if (vq->vq_dev->role == VIRTIO_DEV_MASTER) {
 			vring_used_event(&vq->vq_ring) =
 			    vq->vq_used_cons_idx - vq->vq_nentries - 1;
+			metal_cache_flush(&vring_used_event(&vq->vq_ring), sizeof(uint16_t));
 		}
 #endif /*VIRTIO_SLAVE_ONLY*/
 #ifndef VIRTIO_MASTER_ONLY
 		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE) {
 			vring_avail_event(&vq->vq_ring) =
 			    vq->vq_available_idx - vq->vq_nentries - 1;
+			metal_cache_flush(&vring_avail_event(&vq->vq_ring), sizeof(uint16_t));
 		}
 #endif /*VIRTIO_MASTER_ONLY*/
 	} else {
 #ifndef VIRTIO_SLAVE_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_MASTER)
+		if (vq->vq_dev->role == VIRTIO_DEV_MASTER) {
 			vq->vq_ring.avail->flags |= VRING_AVAIL_F_NO_INTERRUPT;
+			metal_cache_flush(&vq->vq_ring.avail->flags, sizeof(uint16_t));
+		}
 #endif /*VIRTIO_SLAVE_ONLY*/
 #ifndef VIRTIO_MASTER_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE)
+		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE) {
 			vq->vq_ring.used->flags |= VRING_USED_F_NO_NOTIFY;
+			metal_cache_flush(&vq->vq_ring.used->flags, sizeof(uint16_t));
+		}
 #endif /*VIRTIO_MASTER_ONLY*/
 	}
 
@@ -399,6 +439,7 @@ uint32_t virtqueue_get_desc_size(struct virtqueue *vq)
 	uint16_t avail_idx = 0;
 	uint32_t len = 0;
 
+	metal_cache_invalidate(&vq->vq_ring.avail->idx, sizeof(uint16_t));
 	if (vq->vq_available_idx == vq->vq_ring.avail->idx) {
 		return 0;
 	}
@@ -406,7 +447,11 @@ uint32_t virtqueue_get_desc_size(struct virtqueue *vq)
 	VQUEUE_BUSY(vq);
 
 	head_idx = vq->vq_available_idx & (vq->vq_nentries - 1);
+
+	metal_cache_invalidate(&vq->vq_ring.avail->ring[head_idx], sizeof(uint16_t));
 	avail_idx = vq->vq_ring.avail->ring[head_idx];
+
+	metal_cache_invalidate(&vq->vq_ring.desc[avail_idx], sizeof(struct vring_desc));
 	len = vq->vq_ring.desc[avail_idx].len;
 
 	VQUEUE_IDLE(vq);
@@ -454,6 +499,8 @@ static uint16_t vq_ring_add_buffer(struct virtqueue *vq,
 		 */
 		if (i >= readable)
 			dp->flags |= VRING_DESC_F_WRITE;
+
+		metal_cache_flush(dp, sizeof(struct vring_desc));
 	}
 
 	return idx;
@@ -544,10 +591,12 @@ static void vq_ring_update_avail(struct virtqueue *vq, uint16_t desc_idx)
 	 */
 	avail_idx = vq->vq_ring.avail->idx & (vq->vq_nentries - 1);
 	vq->vq_ring.avail->ring[avail_idx] = desc_idx;
+	metal_cache_flush(&vq->vq_ring.avail->ring[avail_idx], sizeof(uint16_t));
 
 	atomic_thread_fence(memory_order_seq_cst);
 
 	vq->vq_ring.avail->idx++;
+	metal_cache_flush(&vq->vq_ring.avail->idx, sizeof(uint16_t));
 
 	/* Keep pending count until virtqueue_notify(). */
 	vq->vq_queued_cnt++;
@@ -566,23 +615,31 @@ static int vq_ring_enable_interrupt(struct virtqueue *vq, uint16_t ndesc)
 	 */
 	if (vq->vq_dev->features & VIRTIO_RING_F_EVENT_IDX) {
 #ifndef VIRTIO_SLAVE_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_MASTER)
+		if (vq->vq_dev->role == VIRTIO_DEV_MASTER) {
 			vring_used_event(&vq->vq_ring) =
 				vq->vq_used_cons_idx + ndesc;
+			metal_cache_flush(&vring_used_event(&vq->vq_ring), sizeof(uint16_t));
+		}
 #endif /*VIRTIO_SLAVE_ONLY*/
 #ifndef VIRTIO_MASTER_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE)
+		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE) {
 			vring_avail_event(&vq->vq_ring) =
 				vq->vq_available_idx + ndesc;
+			metal_cache_flush(&vring_avail_event(&vq->vq_ring), sizeof(uint16_t));
+		}
 #endif /*VIRTIO_MASTER_ONLY*/
 	} else {
 #ifndef VIRTIO_SLAVE_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_MASTER)
+		if (vq->vq_dev->role == VIRTIO_DEV_MASTER) {
 			vq->vq_ring.avail->flags &= ~VRING_AVAIL_F_NO_INTERRUPT;
+			metal_cache_flush(&vq->vq_ring.avail->flags, sizeof(uint16_t));
+		}
 #endif /*VIRTIO_SLAVE_ONLY*/
 #ifndef VIRTIO_MASTER_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE)
+		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE) {
 			vq->vq_ring.used->flags &= ~VRING_USED_F_NO_NOTIFY;
+			metal_cache_flush(&vq->vq_ring.used->flags, sizeof(uint16_t));
+		}
 #endif /*VIRTIO_MASTER_ONLY*/
 	}
 
@@ -637,6 +694,8 @@ static int vq_ring_must_notify(struct virtqueue *vq)
 		if (vq->vq_dev->role == VIRTIO_DEV_MASTER) {
 			new_idx = vq->vq_ring.avail->idx;
 			prev_idx = new_idx - vq->vq_queued_cnt;
+
+			metal_cache_invalidate(&vring_avail_event(&vq->vq_ring), sizeof(uint16_t));
 			event_idx = vring_avail_event(&vq->vq_ring);
 			return vring_need_event(event_idx, new_idx,
 						prev_idx) != 0;
@@ -646,6 +705,8 @@ static int vq_ring_must_notify(struct virtqueue *vq)
 		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE) {
 			new_idx = vq->vq_ring.used->idx;
 			prev_idx = new_idx - vq->vq_queued_cnt;
+
+			metal_cache_invalidate(&vring_used_event(&vq->vq_ring), sizeof(uint16_t));
 			event_idx = vring_used_event(&vq->vq_ring);
 			return vring_need_event(event_idx, new_idx,
 						prev_idx) != 0;
@@ -653,14 +714,18 @@ static int vq_ring_must_notify(struct virtqueue *vq)
 #endif /*VIRTIO_MASTER_ONLY*/
 	} else {
 #ifndef VIRTIO_SLAVE_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_MASTER)
+		if (vq->vq_dev->role == VIRTIO_DEV_MASTER) {
+			metal_cache_invalidate(&vq->vq_ring.used->flags, sizeof(uint16_t));
 			return (vq->vq_ring.used->flags &
 				VRING_USED_F_NO_NOTIFY) == 0;
+		}
 #endif /*VIRTIO_SLAVE_ONLY*/
 #ifndef VIRTIO_MASTER_ONLY
-		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE)
+		if (vq->vq_dev->role == VIRTIO_DEV_SLAVE) {
+			metal_cache_invalidate(&vq->vq_ring.used->flags, sizeof(uint16_t));
 			return (vq->vq_ring.avail->flags &
 				VRING_AVAIL_F_NO_INTERRUPT) == 0;
+		}
 #endif /*VIRTIO_MASTER_ONLY*/
 	}
 
@@ -688,6 +753,7 @@ static int virtqueue_nused(struct virtqueue *vq)
 {
 	uint16_t used_idx, nused;
 
+	metal_cache_invalidate(&vq->vq_ring.used->idx, sizeof(uint16_t));
 	used_idx = vq->vq_ring.used->idx;
 
 	nused = (uint16_t)(used_idx - vq->vq_used_cons_idx);
@@ -707,6 +773,7 @@ static int virtqueue_navail(struct virtqueue *vq)
 {
 	uint16_t avail_idx, navail;
 
+	metal_cache_invalidate(&vq->vq_ring.avail->idx, sizeof(uint16_t));
 	avail_idx = vq->vq_ring.avail->idx;
 
 	navail = (uint16_t)(avail_idx - vq->vq_available_idx);

@@ -8,6 +8,7 @@
  */
 
 #include <metal/alloc.h>
+#include <metal/cache.h>
 #include <metal/sleep.h>
 #include <metal/utilities.h>
 #include <openamp/rpmsg_virtio.h>
@@ -345,6 +346,7 @@ static int rpmsg_virtio_send_offchannel_nocopy(struct rpmsg_device *rdev,
 	struct metal_io_region *io;
 	struct rpmsg_hdr rp_hdr;
 	struct rpmsg_hdr *hdr;
+	unsigned long offset;
 	uint32_t buff_len;
 	uint16_t idx;
 	int status;
@@ -365,8 +367,11 @@ static int rpmsg_virtio_send_offchannel_nocopy(struct rpmsg_device *rdev,
 
 	/* Copy data to rpmsg buffer. */
 	io = rvdev->shbuf_io;
-	status = metal_io_block_write(io, metal_io_virt_to_offset(io, hdr),
-				      &rp_hdr, sizeof(rp_hdr));
+	offset = metal_io_virt_to_offset(io, hdr);
+	status = metal_io_block_write(io, offset, &rp_hdr, sizeof(rp_hdr));
+
+	metal_cache_flush(metal_io_virt(io, offset), sizeof(rp_hdr));
+
 	RPMSG_ASSERT(status == sizeof(rp_hdr), "failed to write header\r\n");
 
 	metal_mutex_acquire(&rdev->lock);
@@ -410,6 +415,7 @@ static int rpmsg_virtio_send_offchannel_raw(struct rpmsg_device *rdev,
 {
 	struct rpmsg_virtio_device *rvdev;
 	struct metal_io_region *io;
+	unsigned long offset;
 	uint32_t buff_len;
 	void *buffer;
 	int status;
@@ -426,8 +432,11 @@ static int rpmsg_virtio_send_offchannel_raw(struct rpmsg_device *rdev,
 	if (len > (int)buff_len)
 		len = buff_len;
 	io = rvdev->shbuf_io;
-	status = metal_io_block_write(io, metal_io_virt_to_offset(io, buffer),
-				      data, len);
+	offset = metal_io_virt_to_offset(io, buffer);
+	status = metal_io_block_write(io, offset, data, len);
+
+	metal_cache_flush(metal_io_virt(io, offset), len);
+
 	RPMSG_ASSERT(status == len, "failed to write buffer\r\n");
 
 	return rpmsg_virtio_send_offchannel_nocopy(rdev, src, dst, buffer, len);
